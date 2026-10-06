@@ -355,6 +355,14 @@ def incoming():
 # --- Public read-only stats (powers the ScamCheck Ghana report dashboard) ---
 @app.get("/stats")
 def public_stats():
+    try:
+        return _stats_payload()
+    except Exception as e:  # diagnostic: surface the real error as JSON
+        return jsonify({"ok": False,
+                        "error": f"{type(e).__name__}: {e}"}), 500
+
+
+def _stats_payload():
     """Aggregate directory stats. Privacy-safe: only *flagged* numbers are
     listed by number (that's the directory's purpose); everything else is
     counts. No reporter identities, no contact details, no WhatsApp IDs."""
