@@ -15,6 +15,7 @@ Run:  python webhook.py   (needs the env vars listed in README.md)
 
 import os
 import re
+from datetime import datetime, timezone
 
 import psycopg2
 import requests
@@ -349,6 +350,98 @@ def incoming():
     except Exception:
         app.logger.exception("webhook error")
     return jsonify({"ok": True})
+
+
+# --- Public read-only stats (powers the ScamCheck Ghana report dashboard) ---
+@app.get("/stats")
+def public_stats():
+    """Aggregate directory stats. Privacy-safe: only *flagged* numbers are
+    listed by number (that's the directory's purpose); everything else is
+    counts. No reporter identities, no contact details, no WhatsApp IDs."""
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "select risk_status, count(*) as n from phone_numbers group by risk_status")
+        by_status = {r["risk_status"]: r["n"] for r in cur.fetchall()}
+
+        cur.execute("select count(*) as n from reports")
+        total_reports = cur.fetchone()["n"]
+        cur.execute(
+            "select count(*) as n from reports "
+            "where created_at > now() - interval '24 hours'")
+        reports_24h = cur.fetchone()["n"]
+        cur.execute(
+            "select count(*) as n from reports "
+            "where created_at > now() - interval '7 days'")
+        reports_7d = cur.fetchone()["n"]
+
+        cur.execute("select count(*) as n from users")
+        total_users = cur.fetchone()["n"]
+        cur.execute(
+            "select count(*) as n from users "
+            "where last_seen_at > now() - interval '7 days'")
+        users_7d = cur.fetchone()["n"]
+
+        cur.execute(
+            "select count(*) as n from disputes where status = 'pending'")
+        disputes_pending = cur.fetchone()["n"]
+
+        cur.execute(
+            "select scam_type, count(*) as n from reports group by scam_type")
+        scam_types = {r["scam_type"]: r["n"] for r in cur.fetchall()}
+
+        cur.execute(
+            """select display_number, unique_reporters,
+                      first_reported_at, last_reported_at
+               from phone_numbers
+               where risk_status = 'flagged'
+               order by unique_reporters desc
+               limit 50""")
+        flagged = []
+        for r in cur.fetchall():
+            cur.execute(
+                """select r2.scam_type from reports r2
+                   join phone_numbers p on p.id = r2.phone_number_id
+                   where p.display_number = %s
+                   group by r2.scam_type
+                   order by count(*) desc limit 1""",
+                (r["display_number"],))
+            top = cur.fetchone()
+            flagged.append({
+                "display_number": r["display_number"],
+                "reports": r["unique_reporters"],
+                "top_trick": SCAM_LABELS.get(top["scam_type"]) if top else None,
+                "first_reported_at": (r["first_reported_at"].isoformat()
+                                      if r["first_reported_at"] else None),
+                "last_reported_at": (r["last_reported_at"].isoformat()
+                                     if r["last_reported_at"] else None),
+            })
+
+        cur.execute(
+            """select to_char(created_at, 'YYYY-MM-DD') as day, count(*) as n
+               from reports
+               where created_at > now() - interval '14 days'
+               group by 1 order by 1""")
+        activity = [{"day": r["day"], "reports": r["n"]} for r in cur.fetchall()]
+
+    return jsonify({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "numbers": {
+            "total": sum(by_status.values()),
+            "flagged": by_status.get("flagged", 0),
+            "watch": by_status.get("watch", 0),
+            "clean": by_status.get("clean", 0),
+        },
+        "reports": {
+            "total": total_reports,
+            "last_24h": reports_24h,
+            "last_7d": reports_7d,
+        },
+        "users": {"total": total_users, "active_7d": users_7d},
+        "disputes_pending": disputes_pending,
+        "scam_types": scam_types,
+        "flagged_numbers": flagged,
+        "recent_activity": activity,
+    })
 
 
 if __name__ == "__main__":
