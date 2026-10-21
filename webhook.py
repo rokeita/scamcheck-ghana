@@ -66,13 +66,13 @@ def db():
 
 
 def get_user(wa_id):
-    """Fetch the user row, creating it (and touching last_seen) on first contact."""
+    """Fetch/create a user; record current processing activity on every text contact."""
     with db() as conn, conn.cursor() as cur:
         cur.execute("select * from users where whatsapp_id = %s", (wa_id,))
         user = cur.fetchone()
         if user:
             cur.execute(
-                "update users set last_seen_at = now() where id = %s",
+                "update users set last_seen_at = greatest(last_seen_at, clock_timestamp()) where id = %s",
                 (user["id"],))
         else:
             cur.execute(
@@ -394,6 +394,14 @@ def incoming():
                     continue
                 for msg in value.get("messages", []):
                     if msg.get("type") != "text":
+                        # Non-text inbound contacts count as activity for an existing
+                        # account, without storing media or creating a new account.
+                        # Status notifications have no messages/from and never enter.
+                        if msg.get("from") and msg.get("type"):
+                            with db() as conn, conn.cursor() as cur:
+                                cur.execute(
+                                    "update users set last_seen_at = greatest(last_seen_at, clock_timestamp()) where whatsapp_id = %s",
+                                    (msg["from"],))
                         continue
                     wa_id = msg["from"]
                     user = get_user(wa_id)
