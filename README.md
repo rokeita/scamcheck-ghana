@@ -51,6 +51,7 @@ Built to run almost free, so the service can stay free for users:
 |---|---|
 | `VERIFY_TOKEN` | Your own secret string for Meta's webhook handshake |
 | `WHATSAPP_TOKEN` | Permanent System User access token |
+| `META_APP_SECRET` | Meta app secret used to verify incoming webhook signatures |
 | `PHONE_NUMBER_ID` | The bot's WhatsApp phone number ID |
 | `DATABASE_URL` | Supabase Postgres connection string |
 | `GRAPH_VERSION` | Optional, defaults to `v21.0` |
@@ -80,7 +81,7 @@ Note: Render's free tier sleeps when idle, so the first message after a quiet sp
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/webhook` | Meta verification handshake |
-| POST | `/webhook` | Incoming WhatsApp messages (always returns 200) |
+| POST | `/webhook` | Signed incoming WhatsApp messages; unsigned/invalid signatures are rejected |
 | GET | `/stats` | Public, privacy-safe JSON for the dashboard: totals, reports in the last 24h and 7 days, scam types, up to 50 flagged numbers, 14-day activity |
 
 ## Roadmap

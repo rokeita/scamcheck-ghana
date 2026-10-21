@@ -13,6 +13,8 @@ Flow:
 Run:  python webhook.py   (needs the env vars listed in README.md)
 """
 
+import hashlib
+import hmac
 import os
 import re
 from datetime import datetime, timezone
@@ -29,6 +31,7 @@ VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]        # you invent this string
 WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"]    # from Meta dashboard
 PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"]  # your bot's number id
 DATABASE_URL = os.environ["DATABASE_URL"]        # Supabase connection string
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")  # verifies incoming Meta signatures
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v21.0")
 API_URL = f"https://graph.facebook.com/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/messages"
 
@@ -369,6 +372,18 @@ def handle_text(user, wa_id, text):
 
 
 # --- Meta webhook endpoints ---
+def valid_meta_signature(raw_body, signature):
+    """Return true only for a valid SHA-256 signature using Meta's app secret."""
+    if not META_APP_SECRET or not isinstance(signature, str):
+        return False
+    if not signature.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        META_APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+
 @app.get("/webhook")
 def verify():
     """Meta's one-time handshake when you register the webhook URL."""
@@ -380,8 +395,20 @@ def verify():
 
 @app.post("/webhook")
 def incoming():
-    """Acknowledge receipt, not processing or delivery. Keep HTTP 200 to avoid
-    adding retries: message handling is not idempotent and may partly commit."""
+    """Acknowledge authenticated receipt, not processing or delivery.
+
+    Keep HTTP 200 for authenticated events to avoid retries: handling is not
+    idempotent and may partly commit. Reject unsigned or invalid events first.
+    """
+    if not META_APP_SECRET:
+        app.logger.error("webhook_rejected reason=signature_secret_unconfigured")
+        return jsonify({"ok": False, "error": "webhook_unavailable"}), 503
+    raw_body = request.get_data(cache=True)
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not valid_meta_signature(raw_body, signature):
+        app.logger.warning("webhook_rejected reason=invalid_signature")
+        return jsonify({"ok": False, "error": "invalid_signature"}), 403
+
     data = request.get_json(force=True, silent=True) or {}
     try:
         for entry in data.get("entry", []):
