@@ -281,7 +281,8 @@ def handle_dispute(user, wa_id, text):
                    values (%s, %s, %s)""",
                 (row["id"], wa_id, explanation))
             send_text(wa_id,
-                      "Received. A human reviews every dispute within 48 hours. 🙏")
+                      "Your dispute has been recorded. For questions or supporting "
+                      "information, email kwekudonkorebenezer@gmail.com.")
     set_state(user["id"], "idle")
 
 
