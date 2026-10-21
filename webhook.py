@@ -162,29 +162,47 @@ def handle_check(wa_id, canonical):
     with db() as conn, conn.cursor() as cur:
         cur.execute("select * from phone_numbers where number = %s", (canonical,))
         row = cur.fetchone()
+        # Read stored reports, not the cached risk label: one/two reports can
+        # legitimately coexist with risk_status='clean'. Do not call that safe.
+        reporters = 0
+        if row:
+            cur.execute(
+                "select count(distinct reporter_id) as n from reports "
+                "where phone_number_id = %s", (row["id"],))
+            reporters = cur.fetchone()["n"]
+        if reporters:
+            cur.execute(
+                """select scam_type, count(*) as n from reports
+                   where phone_number_id = %s
+                   group by scam_type order by n desc limit 3""",
+                (row["id"],))
+            tricks = ", ".join(SCAM_LABELS[r["scam_type"]]
+                               for r in cur.fetchall())
 
-    if not row or row["risk_status"] == "clean":
+    if not reporters:
         send_text(
             wa_id,
-            f"✅ *{disp}* has no fraud reports.\n"
-            "That doesn't guarantee safety — scammers use new numbers daily. "
+            f"*{disp}*: no community reports are currently recorded in this directory.\n"
+            "That does not mean the number is safe. "
             "Never share your MoMo PIN with anyone.\n"
             "Something fishy happened? Reply REPORT to log it.")
         return
 
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """select scam_type, count(*) as n from reports
-               where phone_number_id = %s
-               group by scam_type order by n desc limit 3""",
-            (row["id"],))
-        tricks = ", ".join(SCAM_LABELS[r["scam_type"]] for r in cur.fetchall())
-
+    source = "user" if reporters == 1 else "users"
+    threshold = (
+        "This is below the directory's three-reporter flagging threshold."
+        if reporters < 3 else
+        "This meets the directory's three-reporter flagging threshold."
+    )
     send_text(
         wa_id,
-        f"🚨 *{disp}* has been reported {row['unique_reporters']} times.\n"
-        f"Common tricks: {tricks}.\n"
-        "⚠️ Do NOT send money or share your PIN.\n"
+        f"*{disp}*: community reports from {reporters} distinct WhatsApp {source}.\n"
+        f"{threshold}\n"
+        f"Reported categories: {tricks}.\n"
+        "These reports are not independently verified and are not proof of fraud. "
+        "A report count does not establish whether a number is safe.\n"
+        "Do not send money based only on a message or call, or share your MoMo PIN.\n"
+        "Number listed unfairly? Reply DISPUTE.\n"
         "Was this helpful? Reply YES or NO.")
 
 
@@ -392,15 +410,18 @@ def incoming():
 def public_stats():
     try:
         return _stats_payload()
-    except Exception as e:  # diagnostic: surface the real error as JSON
-        return jsonify({"ok": False,
-                        "error": f"{type(e).__name__}: {e}"}), 500
+    except Exception:
+        # Never expose exception/SQL/connection details to the public or logs.
+        app.logger.error("stats_failed")
+        return jsonify({"ok": False, "error": "stats_unavailable"}), 500
 
 
 def _stats_payload():
-    """Aggregate directory stats. Privacy-safe: only *flagged* numbers are
-    listed by number (that's the directory's purpose); everything else is
-    counts. No reporter identities, no contact details, no WhatsApp IDs."""
+    """Aggregate counts only; do not enumerate individual directory records.
+
+    Keep flagged_numbers as an empty list for legacy dashboard clients.
+    Exact aggregate counts are public, not anonymisation guarantees.
+    """
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             "select risk_status, count(*) as n from phone_numbers group by risk_status")
@@ -433,33 +454,6 @@ def _stats_payload():
         scam_types = {r["scam_type"]: r["n"] for r in cur.fetchall()}
 
         cur.execute(
-            """select display_number, unique_reporters,
-                      first_reported_at, last_reported_at
-               from phone_numbers
-               where risk_status = 'flagged'
-               order by unique_reporters desc
-               limit 50""")
-        flagged = []
-        for r in cur.fetchall():
-            cur.execute(
-                """select r2.scam_type from reports r2
-                   join phone_numbers p on p.id = r2.phone_number_id
-                   where p.display_number = %s
-                   group by r2.scam_type
-                   order by count(*) desc limit 1""",
-                (r["display_number"],))
-            top = cur.fetchone()
-            flagged.append({
-                "display_number": r["display_number"],
-                "reports": r["unique_reporters"],
-                "top_trick": SCAM_LABELS.get(top["scam_type"]) if top else None,
-                "first_reported_at": (r["first_reported_at"].isoformat()
-                                      if r["first_reported_at"] else None),
-                "last_reported_at": (r["last_reported_at"].isoformat()
-                                     if r["last_reported_at"] else None),
-            })
-
-        cur.execute(
             """select to_char(created_at, 'YYYY-MM-DD') as day, count(*) as n
                from reports
                where created_at > now() - interval '14 days'
@@ -482,7 +476,7 @@ def _stats_payload():
         "users": {"total": total_users, "active_7d": users_7d},
         "disputes_pending": disputes_pending,
         "scam_types": scam_types,
-        "flagged_numbers": flagged,
+        "flagged_numbers": [],
         "recent_activity": activity,
     })
 
