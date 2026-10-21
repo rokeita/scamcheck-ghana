@@ -91,15 +91,43 @@ def set_state(user_id, state, state_data=None):
 
 # --- WhatsApp sending ---
 def send_text(to, body):
-    requests.post(
-        API_URL,
-        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
-        json={"messaging_product": "whatsapp",
-              "to": to,
-              "type": "text",
-              "text": {"body": body}},
-        timeout=15,
-    )
+    """Attempt once. Log safe failure categories; never log payloads or credentials.
+
+    A true result means Graph accepted the request, not WhatsApp delivery.
+    Do not raise to the webhook or retry here: the request may already be sent.
+    """
+    try:
+        response = requests.post(
+            API_URL,
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            json={"messaging_product": "whatsapp",
+                  "to": to,
+                  "type": "text",
+                  "text": {"body": body}},
+            timeout=15,
+        )
+    except requests.RequestException:
+        # A timeout can have an unknown send outcome. Never log exception text.
+        app.logger.error("whatsapp_send_failed reason=transport outcome=unknown")
+        return False
+
+    if not 200 <= response.status_code < 300:
+        # Do not log Graph bodies: they may contain message/recipient details.
+        app.logger.error("whatsapp_send_failed reason=http status=%s",
+                         response.status_code)
+        return False
+    try:
+        result = response.json()
+    except ValueError:
+        app.logger.error("whatsapp_send_failed reason=invalid_json")
+        return False
+    if (not isinstance(result, dict) or result.get("error")
+            or not isinstance(result.get("messages"), list)
+            or not any(isinstance(message, dict) and message.get("id")
+                       for message in result["messages"])):
+        app.logger.error("whatsapp_send_failed reason=unexpected_response")
+        return False
+    return True
 
 
 # --- Phone number handling ---
@@ -333,13 +361,19 @@ def verify():
 
 @app.post("/webhook")
 def incoming():
-    """Receive user messages. Always 200 — Meta retries anything else,
-    and the reports table's unique constraint makes retries harmless."""
+    """Acknowledge receipt, not processing or delivery. Keep HTTP 200 to avoid
+    adding retries: message handling is not idempotent and may partly commit."""
     data = request.get_json(force=True, silent=True) or {}
     try:
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
-                for msg in change.get("value", {}).get("messages", []):
+                value = change.get("value", {})
+                metadata = value.get("metadata") if isinstance(value, dict) else None
+                if (not isinstance(metadata, dict)
+                        or metadata.get("phone_number_id") != PHONE_NUMBER_ID):
+                    app.logger.warning("webhook_ignored reason=phone_id_mismatch_or_missing")
+                    continue
+                for msg in value.get("messages", []):
                     if msg.get("type") != "text":
                         continue
                     wa_id = msg["from"]
@@ -348,7 +382,8 @@ def incoming():
                         continue
                     handle_text(user, wa_id, msg["text"]["body"])
     except Exception:
-        app.logger.exception("webhook error")
+        # Exception/SQL text may include personal data; do not emit it or a traceback.
+        app.logger.error("webhook_processing_failed")
     return jsonify({"ok": True})
 
 
