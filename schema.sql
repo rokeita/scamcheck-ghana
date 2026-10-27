@@ -26,7 +26,13 @@ create table if not exists phone_numbers (
     unique_reporters   integer     not null default 0,  -- 3+ = flagged
     first_reported_at  timestamptz,
     last_reported_at   timestamptz,
-    created_at         timestamptz not null default now()
+    created_at         timestamptz not null default now(),
+    -- Expiry slice: fresh-review date + period behind it, lapse audit,
+    -- and the counting cycle (a lapse starts a new cycle)
+    fresh_review_date     timestamptz,
+    fresh_review_interval interval,
+    lapsed_at             timestamptz,
+    flag_cycle            integer not null default 1
 );
 
 -- One row per report; one report per user per number
@@ -38,7 +44,8 @@ create table if not exists reports (
                      check (scam_type in ('fake_agent', 'wrong_number', 'prize_scam', 'other')),
     description      text,
     created_at       timestamptz not null default now(),
-    unique (phone_number_id, reporter_id)
+    cycle            integer not null default 1,
+    unique (phone_number_id, reporter_id, cycle)
 );
 
 -- Owners of a flagged number asking for review
@@ -48,7 +55,7 @@ create table if not exists disputes (
     contact          text        not null,   -- WhatsApp ID of the person disputing
     explanation      text        not null,
     status           text        not null default 'pending'
-                     check (status in ('pending', 'upheld', 'rejected')),
+                     check (status in ('pending', 'upheld', 'rejected', 'inconclusive')),
     created_at       timestamptz not null default now(),
     reviewed_at      timestamptz
 );
@@ -58,6 +65,8 @@ create index if not exists reports_created_idx    on reports (created_at);
 create index if not exists phone_numbers_risk_idx on phone_numbers (risk_status);
 create index if not exists users_last_seen_idx    on users (last_seen_at);
 create index if not exists disputes_status_idx    on disputes (status);
+create index if not exists phone_numbers_expiry_idx on phone_numbers
+    (risk_status, fresh_review_date) where fresh_review_date is not null;
 
 -- Lock tables away from Supabase's public REST API. The webhook connects
 -- directly with DATABASE_URL as the table owner, so it is unaffected.
