@@ -168,14 +168,15 @@ def handle_check(wa_id, canonical):
         if row:
             cur.execute(
                 "select count(distinct reporter_id) as n from reports "
-                "where phone_number_id = %s", (row["id"],))
+                "where phone_number_id = %s and cycle = %s",
+                (row["id"], row["flag_cycle"]))
             reporters = cur.fetchone()["n"]
         if reporters:
             cur.execute(
                 """select scam_type, count(*) as n from reports
-                   where phone_number_id = %s
+                   where phone_number_id = %s and cycle = %s
                    group by scam_type order by n desc limit 3""",
-                (row["id"],))
+                (row["id"], row["flag_cycle"]))
             tricks = ", ".join(SCAM_LABELS[r["scam_type"]]
                                for r in cur.fetchall())
 
@@ -216,14 +217,17 @@ def finalize_report(user, canonical, scam_type, description=None):
                values (%s, %s)
                on conflict (number) do nothing""",
             (canonical, disp))
-        cur.execute("select id from phone_numbers where number = %s",
+        cur.execute("select id, flag_cycle from phone_numbers where number = %s",
                     (canonical,))
-        number_id = cur.fetchone()["id"]
+        _nrow = cur.fetchone()
+        number_id = _nrow["id"]
+        cycle = _nrow["flag_cycle"]
 
         # One report per user per number — enforced here and by the DB constraint.
         cur.execute(
-            "select 1 from reports where phone_number_id = %s and reporter_id = %s",
-            (number_id, user["id"]))
+            "select 1 from reports where phone_number_id = %s and reporter_id = %s "
+            "and cycle = %s",
+            (number_id, user["id"], cycle))
         if cur.fetchone():
             set_state(user["id"], "idle")
             send_text(wa_id,
@@ -231,9 +235,9 @@ def finalize_report(user, canonical, scam_type, description=None):
             return
 
         cur.execute(
-            """insert into reports (phone_number_id, reporter_id, scam_type, description)
-               values (%s, %s, %s, %s)""",
-            (number_id, user["id"], scam_type, description))
+            """insert into reports (phone_number_id, reporter_id, scam_type, description, cycle)
+               values (%s, %s, %s, %s, %s)""",
+            (number_id, user["id"], scam_type, description, cycle))
         cur.execute(
             """update phone_numbers
                set report_count = report_count + 1,
@@ -246,6 +250,15 @@ def finalize_report(user, canonical, scam_type, description=None):
                returning unique_reporters, risk_status""",
             (number_id,))
         updated = cur.fetchone()
+        # EXPIRY SLICE: qualifying new report while F is set restarts the
+        # clock by one full interval (approved SC24 / bucket (a) behavior).
+        cur.execute(
+            """update phone_numbers
+               set fresh_review_date = now() + fresh_review_interval
+               where id = %s
+               and fresh_review_date is not null
+               and fresh_review_interval is not null""",
+            (number_id,))
         cur.execute(
             "update users set reports_made = reports_made + 1 where id = %s",
             (user["id"],))
@@ -366,6 +379,103 @@ def handle_text(user, wa_id, text):
     send_text(wa_id,
               "I only speak numbers 😅 — send a phone number to check, "
               "or reply MENU for options.")
+
+
+# --- Review + expiry ---
+def apply_review(phone_number_id, decision, fresh_review_date=None):
+    """Apply a reviewer decision. decision: SUPPORTS | UNDERMINES | INCONCLUSIVE.
+
+    SUPPORTS: challenge rejected, flag stays.
+    UNDERMINES: challenge upheld, flag comes down (reports are never moved).
+    INCONCLUSIVE: flag stays up and fresh_review_date is set to the supplied
+    F, with fresh_review_interval recorded so a later qualifying report can
+    restart the clock. F must be supplied — the function refuses to invent one.
+    Returns the updated phone_numbers row.
+    """
+    if decision not in ("SUPPORTS", "UNDERMINES", "INCONCLUSIVE"):
+        raise ValueError("unknown decision")
+    if decision == "INCONCLUSIVE" and fresh_review_date is None:
+        raise ValueError("INCONCLUSIVE requires fresh_review_date")
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("select * from phone_numbers where id = %s",
+                    (phone_number_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("unknown phone number")
+        if decision == "SUPPORTS":
+            cur.execute(
+                "update disputes set status = 'rejected', reviewed_at = now() "
+                "where phone_number_id = %s and status = 'pending'",
+                (phone_number_id,))
+            cur.execute(
+                "update phone_numbers set fresh_review_date = NULL, "
+                "fresh_review_interval = NULL where id = %s",
+                (phone_number_id,))
+        elif decision == "UNDERMINES":
+            cur.execute(
+                "update disputes set status = 'upheld', reviewed_at = now() "
+                "where phone_number_id = %s and status = 'pending'",
+                (phone_number_id,))
+            cur.execute(
+                "update phone_numbers set risk_status = 'clean', "
+                "unique_reporters = 0, report_count = 0, "
+                "fresh_review_date = NULL, fresh_review_interval = NULL "
+                "where id = %s",
+                (phone_number_id,))
+        else:  # INCONCLUSIVE
+            cur.execute(
+                "update disputes set status = 'inconclusive', "
+                "reviewed_at = now() "
+                "where phone_number_id = %s and status = 'pending'",
+                (phone_number_id,))
+            cur.execute(
+                "update phone_numbers set fresh_review_date = %s, "
+                "fresh_review_interval = %s - now() "
+                "where id = %s",
+                (fresh_review_date, fresh_review_date, phone_number_id))
+        cur.execute("select * from phone_numbers where id = %s",
+                    (phone_number_id,))
+        return cur.fetchone()
+
+
+def process_expiry(now=None):
+    """Lapse flags whose fresh-review date has passed.
+
+    now defaults to real time; tests pass explicit times (that is the
+    virtual clock for this slice). Idempotent: a second run changes nothing.
+    Numbers with a pending dispute are skipped — a live challenge beats the
+    clock. Old reports stay in the database under their old cycle (audit);
+    they no longer count. Returns the list of lapsed phone_number ids.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    lapsed = []
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """select id from phone_numbers
+               where risk_status = 'flagged'
+               and fresh_review_date is not null
+               and fresh_review_date <= %s
+               and not exists (
+                   select 1 from disputes
+                   where disputes.phone_number_id = phone_numbers.id
+                   and disputes.status = 'pending')""",
+            (now,))
+        ids = [r["id"] for r in cur.fetchall()]
+        for pid in ids:
+            cur.execute(
+                """update phone_numbers
+                   set risk_status = 'clean',
+                       unique_reporters = 0,
+                       report_count = 0,
+                       flag_cycle = flag_cycle + 1,
+                       lapsed_at = %s,
+                       fresh_review_date = NULL,
+                       fresh_review_interval = NULL
+                   where id = %s""",
+                (now, pid))
+            lapsed.append(pid)
+    return lapsed
 
 
 # --- Meta webhook endpoints ---
