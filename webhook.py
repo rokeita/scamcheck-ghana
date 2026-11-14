@@ -62,12 +62,15 @@ GH_PREFIXES = {"20", "23", "24", "25", "26", "27", "28", "29",
 # --- Database helpers ---
 @contextmanager
 def db():
-    # psycopg2's own `with conn:` only ends the transaction; it never closes
-    # the connection, which leaked one connection per query.
+    # psycopg2's `with conn:` only ends the transaction; it never closes the
+    # connection, which leaked one connection per query.
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     conn.autocommit = True
     try:
-        yield conn
+        # `with conn` wraps the block in a transaction (psycopg2 >= 2.9 does so
+        # even in autocommit mode), keeping multi-statement updates atomic.
+        with conn:
+            yield conn
     finally:
         conn.close()
 
