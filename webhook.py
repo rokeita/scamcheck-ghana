@@ -15,6 +15,7 @@ Run:  python webhook.py   (needs the env vars listed in README.md)
 
 import os
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import psycopg2
@@ -59,10 +60,16 @@ GH_PREFIXES = {"20", "23", "24", "25", "26", "27", "28", "29",
 
 
 # --- Database helpers ---
+@contextmanager
 def db():
+    # psycopg2's own `with conn:` only ends the transaction; it never closes
+    # the connection, which leaked one connection per query.
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     conn.autocommit = True
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def get_user(wa_id):
@@ -335,6 +342,10 @@ def handle_text(user, wa_id, text):
             send_text(wa_id, "Reply with 1, 2, 3 or 4 — or CANCEL to stop.")
             return
         canonical = (user["state_data"] or {}).get("pending_number")
+        if not canonical:
+            set_state(user["id"], "awaiting_number")
+            send_text(wa_id, "Sorry, I lost track of the number. Send it again, e.g. 0551234567.")
+            return
         if mapping[low] == "other":
             set_state(user["id"], "awaiting_description",
                       {"pending_number": canonical})
@@ -345,6 +356,10 @@ def handle_text(user, wa_id, text):
 
     if state == "awaiting_description":
         canonical = (user["state_data"] or {}).get("pending_number")
+        if not canonical:
+            set_state(user["id"], "awaiting_number")
+            send_text(wa_id, "Sorry, I lost track of the number. Send it again, e.g. 0551234567.")
+            return
         finalize_report(user, canonical, "other", description=t[:500])
         return
 
@@ -353,9 +368,15 @@ def handle_text(user, wa_id, text):
         return
 
     # state == "idle": route by keyword, else treat any number as a check
-    if low in ("hi", "hello", "menu", "start", "1", "check"):
-        send_text(wa_id, MENU if low != "check" else
+    if low in ("hi", "hello", "menu", "start"):
+        send_text(wa_id, MENU)
+        return
+    if low in ("1", "check"):
+        send_text(wa_id,
                   "Send me the number you want to check — 10 digits, e.g. 0551234567.")
+        return
+    if low in ("yes", "no"):
+        send_text(wa_id, "Thanks for the feedback! 🙏")
         return
     if low in ("help", "3"):
         send_text(wa_id, HELP_TEXT)
