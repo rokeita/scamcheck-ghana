@@ -54,6 +54,16 @@ HELP_TEXT = (
     "3+ unique reports = flagged. Number flagged unfairly? Reply DISPUTE."
 )
 
+SIM_TRANSFER_WARNING = (
+    "⚠️ *Agent SIM ownership-transfer fee — scam warning*\n"
+    "MoMo agents are being told to pay a fee to change or transfer "
+    "ownership of their Agent Business SIM.\n\n"
+    "The regularisation exercise has not commenced, and Mobile Money "
+    "Fintech Ltd does not charge any fee for transfer of ownership.\n\n"
+    "Do not pay. If you are asked for such a fee, report it by dialling "
+    "*419* from an MTN number. Never share your MoMo PIN with anyone."
+)
+
 # Ghana mobile network prefixes (the two digits after the leading 0)
 GH_PREFIXES = {"20", "23", "24", "25", "26", "27", "28", "29",
                "50", "53", "54", "55", "56", "57", "59"}
@@ -395,6 +405,9 @@ def handle_text(user, wa_id, text):
         send_text(wa_id,
                   "Sorry about that. Send the number plus a short explanation "
                   "in one message.")
+        return
+    if re.search(r"\b(sim|ownership|regularisation|regularization)\b", low):
+        send_text(wa_id, SIM_TRANSFER_WARNING)
         return
     canonical = extract_number(t)
     if canonical:
